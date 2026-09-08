@@ -125,10 +125,12 @@ model sits at **~5.9–6.5 GB** on Apple Silicon. Flash-MoE keeps only a small
 How it works:
 
 - **File-backed checkpoint.** Expert weights stay on disk. A byte-range reader
-  (`_DiskHolder` in `mlx_lm/models/switch_layers.py`) memory-maps the shards once
-  and slices only the currently-active expert rows via numpy — the full 256-expert
-  tensor is never materialized, and repeated rows are served from the OS page
-  cache instead of fresh `open()`/`seek()` syscalls.
+  (`_DiskHolder` in `mlx_lm/models/switch_layers.py`) reads only selected rows.
+  Small decode selections use cached file handles and `pread`, reusing rows
+  from the previous selection. Batch selections use memory-mapped NumPy views.
+  The host cache retains at most eight rows / 2 MiB per source and clears that
+  source on larger selections; for Maple this adds at most about 145 MiB of
+  cached raw weights and scales, independently of the MLX execution tensors.
 - **IFP (Inactive-Expert-Free Policy).** The gating function is masked to the
   active set, so only resident experts are ever scored.
 - **Per-token reselect.** The active set is recomputed from the *current token's*
@@ -183,6 +185,91 @@ python -m mlx_lm generate --model ./maple-2bit-mlx --trust-remote-code \
 
 python -m mlx_lm chat --model ./maple-2bit-mlx --trust-remote-code \
   --flash-moe --active-experts 8 --kv-bits 8 --kv-v-bits 4 --max-tokens -1
+```
+
+### Reproduce the flash-MoE optimization benchmark
+
+For interactive serving, `--prefill-step-size 1` minimizes expert memory but is
+slow. A small increase to `--prefill-step-size 4`, with prompt/decode concurrency
+both kept at 1, processes four prompt tokens per chunk. In a short warmed M2
+test this raised prefill from 16.7 to 22.6 tokens/s, while peak process memory
+rose from 1.34 to 1.72 GB. Larger contexts add KV-cache memory. At top-8 routing,
+a four-token chunk selects at most 32 experts per layer, rather than the full
+256. These timings are from the checkpoint harness, not an HTTP load test;
+batching can also change floating-point rounding and sampled output.
+
+Maple now uses a cache-only prefill path in generation and server prompt
+processing. It skips the final layer's MLP and expert paging when its output
+is discarded: that MLP cannot affect the KV caches. Fixed or stale flash
+routing and shared expert caches retain the original MLP calls to preserve
+routing state. This applies automatically, without changing server flags.
+
+A paired M2 test using the actual server prompt-processing class, an 18-token
+prompt, and step size 4 measured 17.75 → 18.58 prompt tokens/s (1.047×).
+The two measured runs per variant followed two warmup runs; timings varied
+substantially, so this is preliminary evidence of a modest gain. All compared
+logits were bit-exact. Peak process memory across both variants was 1.93 GB;
+the loader skipped the full 4.87 GB expert tensors. Reproduce with:
+
+```sh
+python benchmarks/maple_checkpoint_benchmark.py \
+  --model /path/to/maple-2bit-mlx --variant optimized \
+  --server-prefill --compare-prefill-hook --prefill-step-size 4 --tokens 1 \
+  --prompt 'Please explain in simple terms why the sky looks blue during the day and red at sunset.'
+```
+
+The low-memory checkpoint benchmark keeps eight experts per layer in the MLX
+execution tensors. It skips full expert tensors during model construction and
+feeds the prompt one token at a time to bound the prefill expert set. The exact
+head is enabled and the short KV cache is unquantized. A watchdog exits if
+observed process memory exceeds 2 GiB; this is monitoring, not a hard OS
+allocation limit.
+
+Run the variants sequentially:
+
+```sh
+python benchmarks/maple_checkpoint_benchmark.py \
+  --model /path/to/maple-2bit-mlx --variant baseline --tokens 8 --runs 3 \
+  --continuation ' Paris, a city known for its history and culture.'
+python benchmarks/maple_checkpoint_benchmark.py \
+  --model /path/to/maple-2bit-mlx --variant optimized --tokens 8 --runs 3 \
+  --continuation ' Paris, a city known for its history and culture.'
+```
+
+With `--runs 3`, the first run warms up the model and the next two contribute
+16 timed decode steps. `--continuation` feeds a fixed, varied token sequence,
+so a repeated greedy token cannot inflate cache-hit benefits. The SHA-256
+covers every prompt/decode logit tensor, and the harness also checks that
+repeated runs produce identical logits. `--profile /tmp/decode.prof` optionally
+writes a decode-only cProfile trace for each run.
+
+Measured on Apple M2 (16 GB), MLX 0.32.2, with the local 5.31 GB Maple checkpoint
+against revision `210e6d6`:
+
+| measurement | original | optimized |
+| --- | --- | --- |
+| warmed decode throughput | 11.62 tokens/s | 19.53 tokens/s |
+| peak process memory | 1.44 GB | 1.34 GB |
+| peak MLX allocations | 0.65 GB | 0.65 GB |
+
+This short comparison measured **1.68× throughput**, with bit-exact logits.
+The loader skipped 4.87 GB of expert data. It does not establish 5× overall
+inference speed, long-context performance, or output quality. Cold-start runs
+varied substantially; compare the same workload after warmup on your hardware.
+
+The optimized path transfers routing IDs once, builds slot maps and masks on
+the CPU, preserves BF16 scale bits directly, and materializes contiguous scale
+groups for efficient M2 quantized matmuls. An unchanged active set reuses its
+resident tensors; partially overlapping sets reuse raw rows from the bounded
+host cache. The masked router bypasses two redundant synchronous residency
+checks per layer. Routing, expert counts, and quantization settings are unchanged.
+
+A separate synthetic activation/forward benchmark and regression tests are
+available without downloading a checkpoint:
+
+```sh
+python benchmarks/flash_moe_benchmark.py --baseline-ref 210e6d6 --forward --repeats 20
+python -m pytest tests/test_flash_moe.py tests/test_maple_kernels.py -q
 ```
 
 ## KV cache quantization

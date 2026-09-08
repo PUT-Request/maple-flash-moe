@@ -86,9 +86,13 @@ class _DiskHolder:
     (up_proj, gate_proj) and concatenated per row.
     """
 
-    def __init__(self):
+    def __init__(self, row_cache_limit=0):
         self.index = None
         self._maps = {}
+        self._files = {}
+        self._row_cache = {}
+        self._row_cache_limit = row_cache_limit
+        self._row_cache_bytes = 2 * 1024 * 1024
 
     def _mmap(self, fp):
         import mmap as _mmap
@@ -100,22 +104,66 @@ class _DiskHolder:
             self._maps[fp] = m
         return m
 
+    def _read_cached_rows(self, sf_key, ids):
+        """Read small selections with pread and reuse only the previous rows.
+
+        Maple caches at most eight rows / 2 MiB per source. No views into older
+        selections are retained. File objects close their descriptors when
+        this holder is released.
+        """
+        import os
+
+        location = self.index[sf_key]
+        fp, abs_off, dt_str, shape = location
+        np_dt, _ = _SAFETENSORS_DTYPE[dt_str]
+        row_bytes = math.prod(shape[1:]) * np.dtype(np_dt).itemsize
+        ids = [int(e) + shape[0] if int(e) < 0 else int(e) for e in ids]
+        if any(e < 0 or e >= shape[0] for e in ids):
+            raise IndexError("expert row index out of bounds")
+        previous = self._row_cache.get(sf_key)
+        positions = previous[1] if previous and previous[0] == location else {}
+        out = np.empty((len(ids), *shape[1:]), dtype=np_dt)
+        for i, eid in enumerate(ids):
+            if eid in positions:
+                out[i] = previous[2][positions[eid]]
+                continue
+            file = self._files.get(fp)
+            if file is None:
+                file = self._files[fp] = open(fp, "rb", buffering=0)
+            offset = abs_off + eid * row_bytes
+            data = os.pread(file.fileno(), row_bytes, offset)
+            while len(data) < row_bytes:
+                tail = os.pread(file.fileno(), row_bytes - len(data), offset + len(data))
+                if not tail:
+                    raise EOFError(f"Incomplete expert row in {fp}: {sf_key}[{eid}]")
+                data += tail
+            out[i] = np.frombuffer(data, dtype=np_dt).reshape(shape[1:])
+        if out.nbytes <= self._row_cache_bytes:
+            self._row_cache[sf_key] = (location, {e: i for i, e in enumerate(ids)}, out)
+        else:
+            self._row_cache.pop(sf_key, None)
+        return out
+
     def read(self, sf_key, ids):
         fp, abs_off, dt_str, shape = self.index[sf_key]
         np_dt, mlx_dt = _SAFETENSORS_DTYPE[dt_str]
-        row_elems = int(np.prod(shape[1:]))
-        row_bytes = row_elems * np.dtype(np_dt).itemsize
-        mm = self._mmap(fp)
-        out = np.empty((len(ids), *shape[1:]), dtype=np_dt)
-        for i, e in enumerate(ids):
-            off = abs_off + int(e) * row_bytes
-            row = np.frombuffer(mm, dtype=np_dt, count=row_elems, offset=off)
-            out[i].reshape(-1)[:] = row
+        if self._row_cache_limit and len(ids) <= self._row_cache_limit:
+            out = self._read_cached_rows(sf_key, ids)
+        else:
+            # Batch prefill can select hundreds of experts. Never keep a host
+            # copy of that union in the small decode cache.
+            self._row_cache.pop(sf_key, None)
+            row_elems = math.prod(shape[1:])
+            mm = self._mmap(fp)
+            # The view is file-backed; indexing copies only requested rows.
+            source = np.frombuffer(
+                mm, dtype=np_dt, count=shape[0] * row_elems, offset=abs_off
+            ).reshape(shape)
+            out = source[np.asarray(ids, dtype=np.intp)]
         if mlx_dt == mx.bfloat16:
-            # Reinterpret the 16-bit patterns as bfloat16 (bf16 == top half of
-            # float32) rather than casting the integer bit values.
-            out = (out.astype(np.uint32) << 16).view(np.float32)
-            return mx.array(out, dtype=mx.float32).astype(mx.bfloat16)
+            # Preserve the bits directly; a float32 round trip adds a GPU
+            # conversion dispatch to every scale read.
+            return mx.array(out).view(mx.bfloat16)
         return mx.array(out, dtype=mlx_dt)
 
 
@@ -263,8 +311,9 @@ class ExpertSlotCache:
 
 
 def _flash_init_resident(self, E, file_index, key_prefix, group_size=128):
-    self.disk = _DiskHolder()
+    self.disk = _DiskHolder(row_cache_limit=min(E, 8))
     self.disk.index = file_index
+    self._flash_ifp = False
     self._flash_group_size = group_size
     self.real_num_experts = 256
     base = key_prefix.rsplit(".", 1)[0]  # '...model.layers.N.mlp.switch_mlp'
@@ -290,6 +339,7 @@ def _flash_init_resident(self, E, file_index, key_prefix, group_size=128):
     self.scales = mx.zeros((E, out_dim, ngroups), dtype=mx.bfloat16)
     self.biases = mx.zeros((E, out_dim, ngroups), dtype=mx.bfloat16)
     self.active_ids = None
+    self._active_id_list = None
     self.slot_of = None
     self.cache_enabled = True
     self._age = mx.zeros((E,), dtype=mx.uint32)
@@ -297,25 +347,33 @@ def _flash_init_resident(self, E, file_index, key_prefix, group_size=128):
 
 
 def _flash_set_active(self, ids):
-    ids = mx.array(ids, dtype=mx.int32)
-    self.active_ids = ids
-    idx = mx.arange(self.real_num_experts)
-    matches = (idx[:, None] == ids[None, :]).astype(mx.int32)
-    slots = mx.arange(ids.shape[0])[None, :]
-    pos = (matches * slots).sum(1)
-    pos = mx.where(matches.any(1), pos, -1)
-    self.slot_of = pos
-    id_list = [int(e) for e in ids]
+    # Routing already needs these ids on the host for disk reads. Transfer once,
+    # rather than synchronizing the GPU separately for every expert.
+    id_list = ids.tolist() if isinstance(ids, mx.array) else list(ids)
+    id_list = [int(e) for e in id_list]
+    if id_list == getattr(self, "_active_id_list", None):
+        return
+    self.active_ids = mx.array(id_list, dtype=mx.int32)
+    pos = np.full(self.real_num_experts, -1, dtype=np.int32)
+    pos[id_list] = np.arange(len(id_list), dtype=np.int32)
+    self.slot_of = mx.array(pos)
     w_parts = [self.disk.read(sk, id_list) for sk in self._src_weight]
     self.weight = mx.concatenate(w_parts, axis=1) if self._concat else w_parts[0]
     ngroups = self.weight.shape[-1] * 16 // self._flash_group_size
     a_parts = [self.disk.read(sk, id_list) for sk in self._src_alpha]
-    s_parts = [mx.broadcast_to(a[..., None], (*a.shape, ngroups)) for a in a_parts]
-    self.scales = mx.concatenate(s_parts, axis=1) if self._concat else s_parts[0]
+    alpha = mx.concatenate(a_parts, axis=1) if self._concat else a_parts[0]
+    # gather_qmm is much slower on M2 with zero-stride scale groups. Expand
+    # after concatenating the small row alphas, then materialize once.
+    self.scales = mx.contiguous(
+        mx.broadcast_to(alpha[..., None], (*alpha.shape, ngroups))
+    )
     self.biases = -self.scales
+    self._age = mx.zeros((len(id_list),), dtype=mx.uint32)
+    self._active_id_list = id_list
 
 
 def _flash_page(self, eid: int):
+    self._active_id_list = None
     slot = int(mx.argmin(self._age))
     id_list = [eid]
     w_parts = [self.disk.read(sk, id_list) for sk in self._src_weight]
@@ -352,6 +410,11 @@ def _flash_resolve(self, indices):
     if not self.cache_enabled:
         return indices
     slot = self.slot_of[indices]
+    # Maple's IFP router is masked to the active set. Its requests cannot
+    # miss, so checking mx.any(miss) would only force a GPU/CPU round trip
+    # on each projection. Keep the paging path for unrestricted callers.
+    if getattr(self, "_flash_ifp", False):
+        return slot
     miss = slot < 0
     if mx.any(miss):
         flat_idx = indices.reshape(-1)

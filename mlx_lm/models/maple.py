@@ -713,13 +713,14 @@ class MapleGate(nn.Module):
 
     def set_active(self, ids):
         """Restrict routing to the given expert ids (IFP)."""
+        import numpy as np
+
         self.flash = True
         self.active_ids = ids
-        ids_a = mx.array(ids, dtype=mx.int32)
-        idx = mx.arange(self.num_experts)
-        sel = (idx[None, :] == ids_a[:, None]).any(0)
-        mask = mx.where(sel, 0.0, float("-inf")).astype(mx.float32)
-        self.active_mask = mask
+        id_list = ids.tolist() if isinstance(ids, mx.array) else list(ids)
+        mask = np.full(self.num_experts, -np.inf, dtype=np.float32)
+        mask[id_list] = 0.0
+        self.active_mask = mx.array(mask)
         self._fused = False
 
 
@@ -809,7 +810,6 @@ class MapleSparseMoeBlock(nn.Module):
         # the cap is lossless (bit-exact baseline routing).
         if len(active) > fm.active and x.shape[1] == 1:
             active = active[: fm.active]
-        active = mx.array(active, dtype=mx.int32)
         self.switch_mlp.set_active(active)
         self.gate.set_active(active)
         # For batch prefill the active set is the full union, so the IFP mask
@@ -923,6 +923,7 @@ class FlashMoE:
                         continue
                     key_prefix = f"model.layers.{l_idx}.mlp.switch_mlp.{name}"
                     sl.init_resident(self.active, index, key_prefix, group_size)
+                    sl._flash_ifp = True
         return self
 
 
@@ -996,7 +997,7 @@ class MapleModel(nn.Module):
         self._fused_add_norm = None  # None = unprobed, then True/False
         self._zero = None
 
-    def _decode_fused(self, h, cache, full_mask, swa_mask):
+    def _decode_fused(self, h, cache, full_mask, swa_mask, cache_only=False):
         """Decode loop with residual adds folded into the norms.
 
         Carries (h, r) instead of adding r back each step, so every
@@ -1008,11 +1009,15 @@ class MapleModel(nn.Module):
             self._zero = mx.zeros(h.shape, h.dtype)
             mx.eval(self._zero)
         r = self._zero  # x + 0 is exact in bf16
-        for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
+        for i, (layer, c, layer_type) in enumerate(
+            zip(self.layers, cache, self.layer_types)
+        ):
             mask = full_mask if layer_type == "full_attention" else swa_mask
             ln = layer.input_layernorm
             h, hn = _add_rms_norm(h, r, ln.weight, ln.eps)
             r = layer.self_attn(hn, mask, c)
+            if cache_only and i == len(self.layers) - 1:
+                return
             ln = layer.post_attention_layernorm
             h, hn = _add_rms_norm(h, r, ln.weight, ln.eps)
             r = layer.mlp(hn)
@@ -1022,6 +1027,7 @@ class MapleModel(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
+        cache_only: bool = False,
     ):
         h = self.word_embeddings(inputs)
 
@@ -1043,10 +1049,15 @@ class MapleModel(nn.Module):
                     h.shape[-1], h.dtype, self.norm.weight, self.norm.eps
                 )
             if self._fused_add_norm:
-                return self._decode_fused(h, cache, full_mask, swa_mask)
+                return self._decode_fused(h, cache, full_mask, swa_mask, cache_only)
 
-        for layer, c, layer_type in zip(self.layers, cache, self.layer_types):
+        for i, (layer, c, layer_type) in enumerate(
+            zip(self.layers, cache, self.layer_types)
+        ):
             mask = full_mask if layer_type == "full_attention" else swa_mask
+            if cache_only and i == len(self.layers) - 1:
+                layer.self_attn(layer.input_layernorm(h), mask, c)
+                return
             h = layer(h, mask, c)
 
         return self.norm(h)
@@ -1172,6 +1183,24 @@ class Model(nn.Module):
             self.lm_head_flash = FlashHead(args)
         else:
             self.lm_head_flash = None
+
+    def prefill_cache(self, inputs: mx.array, cache):
+        """Populate KV caches without computing discarded final-layer outputs.
+
+        The last MLP cannot affect any layer's KV state. Flash routing with
+        fixed/stale expert sets is stateful, however: preserve those selection
+        calls so the subsequent decode behaves exactly as before.
+        """
+        if cache is None:
+            raise ValueError("prefill_cache requires a KV cache")
+        last_mlp = self.model.layers[-1].mlp if self.model.layers else None
+        flash = getattr(last_mlp, "flash", None)
+        can_skip = (
+            flash is None
+            or not flash.enabled
+            or (flash.cache is None and flash.reselect_every == 1)
+        )
+        self.model(inputs, cache, cache_only=can_skip)
 
     def __call__(
         self,

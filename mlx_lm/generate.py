@@ -433,7 +433,14 @@ def generate_step(
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
-    def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
+    def _model_call(
+        input_tokens: mx.array,
+        input_embeddings: Optional[mx.array],
+        cache_only=False,
+    ):
+        prefill = getattr(model, "prefill_cache", None)
+        if cache_only and prefill is not None and input_embeddings is None:
+            return prefill(input_tokens, cache=prompt_cache)
         if input_embeddings is not None:
             return model(
                 input_tokens, cache=prompt_cache, input_embeddings=input_embeddings
@@ -485,6 +492,7 @@ def generate_step(
                     if input_embeddings is not None
                     else None
                 ),
+                cache_only=True,
             )
             quantize_cache_fn(prompt_cache)
             mx.eval([c.state for c in prompt_cache])
@@ -1299,7 +1307,8 @@ class PromptProcessingBatch:
         # Actual prompt processing loop
         while tokens.shape[1] > 0:
             n_to_process = min(self.prefill_step_size, tokens.shape[1])
-            self.model(tokens[:, :n_to_process], cache=self.prompt_cache)
+            prefill = getattr(self.model, "prefill_cache", None) or self.model
+            prefill(tokens[:, :n_to_process], cache=self.prompt_cache)
             mx.eval([c.state for c in self.prompt_cache])
             mx.clear_cache()
             tokens = tokens[:, n_to_process:]
